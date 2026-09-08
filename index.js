@@ -262,6 +262,17 @@ async function handleTelegramIntent(intent, userId, contacts, rawText) {
   }
 }
 
+// TEMP debug route — lists available Groq model IDs. Remove once the model is fixed.
+app.get('/api/debug/groq-models', async (req, res) => {
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/models', { headers: { Authorization: `Bearer ${GROQ_API_KEY}` } });
+    const d = await r.json();
+    res.status(r.status).json({ status: r.status, ids: d.data?.map(m => m.id) ?? d });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'The Relationship Engine API' });
 });
