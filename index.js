@@ -27,7 +27,7 @@ async function sbGet(path) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
     headers: { Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`, apikey: SUPABASE_SERVICE_KEY }
   });
-  if (!res.ok) throw new Error(`Supabase GET ${path} failed: ${res.status}`);
+  if (!res.ok) throw new Error(`Supabase GET ${path} failed: ${res.status} ${await res.text()}`);
   return res.json();
 }
 async function sbPost(path, body) {
@@ -36,7 +36,7 @@ async function sbPost(path, body) {
     headers: { Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`, apikey: SUPABASE_SERVICE_KEY, 'Content-Type': 'application/json', Prefer: 'return=representation' },
     body: JSON.stringify(body)
   });
-  if (!res.ok) throw new Error(`Supabase POST ${path} failed: ${res.status}`);
+  if (!res.ok) throw new Error(`Supabase POST ${path} failed: ${res.status} ${await res.text()}`);
   return res.json();
 }
 async function sbPatch(path, body) {
@@ -45,7 +45,18 @@ async function sbPatch(path, body) {
     headers: { Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`, apikey: SUPABASE_SERVICE_KEY, 'Content-Type': 'application/json', Prefer: 'return=representation' },
     body: JSON.stringify(body)
   });
-  if (!res.ok) throw new Error(`Supabase PATCH ${path} failed: ${res.status}`);
+  if (!res.ok) throw new Error(`Supabase PATCH ${path} failed: ${res.status} ${await res.text()}`);
+  return res.json();
+}
+// Insert-or-update by a unique column — used where a row may already exist from a prior link attempt.
+async function sbUpsert(path, body, onConflict) {
+  const sep = path.includes('?') ? '&' : '?';
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}${sep}on_conflict=${onConflict}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`, apikey: SUPABASE_SERVICE_KEY, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=representation' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error(`Supabase UPSERT ${path} failed: ${res.status} ${await res.text()}`);
   return res.json();
 }
 
@@ -75,7 +86,10 @@ async function tryLinkTelegram(code, chatId, username) {
   const rows = await sbGet(`linking_codes?code=eq.${encodeURIComponent(code)}&used=eq.false&select=*`);
   const row = rows?.[0];
   if (!row || new Date(row.expires_at) < new Date()) return false;
-  await sbPost('telegram_links', { user_id: row.user_id, telegram_chat_id: chatId, telegram_username: username, status: 'active' });
+  // Upsert, not insert: this chat may already have a (possibly revoked) telegram_links
+  // row from a prior link attempt, and telegram_chat_id is UNIQUE — a plain insert would
+  // conflict and throw.
+  await sbUpsert('telegram_links', { user_id: row.user_id, telegram_chat_id: chatId, telegram_username: username, status: 'active' }, 'telegram_chat_id');
   await sbPatch(`linking_codes?code=eq.${encodeURIComponent(code)}`, { used: true });
   return true;
 }
