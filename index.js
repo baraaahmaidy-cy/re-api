@@ -29,6 +29,10 @@ const API_URL = 'https://api.therelationshipengine.xyz';
 const FRONTEND_URL = 'https://therelationshipengine.xyz';
 const TELEGRAM_WEBHOOK_URL = `${API_URL}/api/telegram-webhook`;
 const ALERT_EMAIL = process.env.ALERT_EMAIL || 'baraaahmaidy@gmail.com';
+// A real, monitored reply-to beats a bare noreply@ for deliverability, and a reply
+// from a user should actually reach someone.
+const EMAIL_FROM = process.env.EMAIL_FROM || 'The Relationship Engine <noreply@therelationshipengine.xyz>';
+const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || 'baraaahmaidy@gmail.com';
 
 // ── Supabase REST helpers (service role — every call below scopes by user_id explicitly) ──
 async function sbGet(path) {
@@ -514,12 +518,15 @@ async function runHealthChecks() {
   return failures;
 }
 
-async function sendEmail({ to, subject, html }) {
+async function sendEmail({ to, subject, html, text, headers }) {
   if (!RESEND_FULL_ACCESS_KEY) throw new Error('RESEND_FULL_ACCESS_KEY is not set');
+  const payload = { from: EMAIL_FROM, reply_to: EMAIL_REPLY_TO, to: [to], subject, html };
+  if (text) payload.text = text;
+  if (headers) payload.headers = headers;
   const r = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { Authorization: `Bearer ${RESEND_FULL_ACCESS_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: 'The Relationship Engine <noreply@therelationshipengine.xyz>', to: [to], subject, html })
+    body: JSON.stringify(payload)
   });
   if (!r.ok) throw new Error(`Resend send failed: ${r.status} ${await r.text()}`);
   return r.json();
@@ -721,6 +728,42 @@ function esc(s) {
   return String(s ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
 }
 
+// A plain-text alternative isn't optional: HTML-only mail is a well-known spam
+// signal, and this one was landing in spam without it.
+function renderDigestText(digest, contactCount) {
+  const lines = [];
+  lines.push(digest.overdue.length
+    ? `${digest.overdue.length} relationship${digest.overdue.length === 1 ? '' : 's'} need attention`
+    : 'Your week ahead');
+  lines.push(`Across ${contactCount} contact${contactCount === 1 ? '' : 's'}${digest.never.length ? ` - ${digest.never.length} never contacted` : ''}`);
+
+  if (digest.overdue.length) {
+    lines.push('', 'GOING COLD');
+    for (const c of digest.overdue.slice(0, 8)) {
+      lines.push(`- ${c.name}${c.role ? ` (${c.role})` : ''}: ${c.days} days since contact, ${c.daysOverdue}d past cadence`);
+    }
+    const rest = digest.overdue.length - Math.min(8, digest.overdue.length);
+    if (rest > 0) lines.push(`  + ${rest} more overdue`);
+  }
+  if (digest.dueSoon.length) {
+    lines.push('', 'COMING UP');
+    for (const c of digest.dueSoon.slice(0, 5)) lines.push(`- ${c.name}: due in ${c.daysLeft} day${c.daysLeft === 1 ? '' : 's'}`);
+  }
+  if (digest.birthdays.length) {
+    lines.push('', 'BIRTHDAYS');
+    for (const b of digest.birthdays.slice(0, 5)) lines.push(`- ${b.name}: ${b.days === 0 ? 'today' : `in ${b.days} day${b.days === 1 ? '' : 's'}`}`);
+  }
+  if (digest.tasks.length) {
+    lines.push('', 'TASKS THIS WEEK');
+    for (const t of digest.tasks.slice(0, 8)) lines.push(`- ${t.content} (${t.contactName}, ${t.isOverdue ? 'overdue' : 'due'} ${t.due})`);
+  }
+  if (!digest.hasContent) {
+    lines.push('', 'Nothing needs attention this week - every relationship is within its cadence.');
+  }
+  lines.push('', `Open The Relationship Engine: ${FRONTEND_URL}`);
+  return lines.join('\n');
+}
+
 // Always resolve contacts by the target user's own id — never a shared or default scope.
 async function sendDigestForUser(userId, email, { force = false } = {}) {
   if (!email) return { sent: false, reason: 'no email' };
@@ -736,6 +779,13 @@ async function sendDigestForUser(userId, email, { force = false } = {}) {
       ? `${digest.overdue.length} relationship${digest.overdue.length === 1 ? '' : 's'} need attention this week`
       : 'Your relationships this week',
     html: renderDigestHtml(digest, contacts.length),
+    text: renderDigestText(digest, contacts.length),
+    // Recurring mail without an unsubscribe path gets penalised by Gmail and is
+    // the wrong thing to send regardless.
+    headers: {
+      'List-Unsubscribe': `<mailto:${EMAIL_REPLY_TO}?subject=Unsubscribe%20from%20weekly%20digest>`,
+      'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+    },
   });
   return { sent: true, counts: { overdue: digest.overdue.length, dueSoon: digest.dueSoon.length, birthdays: digest.birthdays.length, tasks: digest.tasks.length } };
 }
@@ -824,4 +874,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { buildDigest, renderDigestHtml, contactState, cadenceFor, birthdayDaysLeft, isoWeekKey };
+module.exports = { buildDigest, renderDigestHtml, renderDigestText, contactState, cadenceFor, birthdayDaysLeft, isoWeekKey };
