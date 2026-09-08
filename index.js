@@ -1,4 +1,4 @@
-cd C:\Users\User\Downloads\re-api// Always use supabase.auth.getUser(). Never hardcode user IDs.
+// Always use supabase.auth.getUser(). Never hardcode user IDs.
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
