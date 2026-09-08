@@ -514,14 +514,23 @@ async function runHealthChecks() {
   return failures;
 }
 
-async function sendAlertEmail(subject, html) {
-  if (!RESEND_FULL_ACCESS_KEY) return;
+async function sendEmail({ to, subject, html }) {
+  if (!RESEND_FULL_ACCESS_KEY) throw new Error('RESEND_FULL_ACCESS_KEY is not set');
   const r = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { Authorization: `Bearer ${RESEND_FULL_ACCESS_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: 'The Relationship Engine <noreply@therelationshipengine.xyz>', to: [ALERT_EMAIL], subject, html })
+    body: JSON.stringify({ from: 'The Relationship Engine <noreply@therelationshipengine.xyz>', to: [to], subject, html })
   });
-  if (!r.ok) console.error('Health alert email failed:', r.status, await r.text());
+  if (!r.ok) throw new Error(`Resend send failed: ${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+async function sendAlertEmail(subject, html) {
+  try {
+    await sendEmail({ to: ALERT_EMAIL, subject, html });
+  } catch (err) {
+    console.error('Health alert email failed:', err.message);
+  }
 }
 
 async function healthTick() {
@@ -557,8 +566,262 @@ app.get('/api/health', (req, res) => {
   res.status(health.ok === false ? 503 : 200).json(health);
 });
 
-app.listen(PORT, () => {
-  console.log(`RE API running on port ${PORT}`);
-  setTimeout(healthTick, 60 * 1000).unref?.();
-  setInterval(healthTick, HEALTH_INTERVAL_MS);
+// ── Weekly digest ─────────────────────────────────────────────────────────────
+// Surfaces relationships going cold. The status rules below intentionally mirror
+// src/utils.ts (contactStatus / getContactCadence) — if the app and the digest
+// disagree about who's overdue, the digest is worse than useless.
+const DIGEST_DAY = Number(process.env.DIGEST_DAY ?? 1); // 0=Sun, 1=Mon
+const DIGEST_HOUR_UTC = Number(process.env.DIGEST_HOUR_UTC ?? 6);
+const DIGEST_TICK_MS = 60 * 60 * 1000;
+const TIER_CADENCE = { close: 14, wider: 45, general: 180 };
+const TIER_RANK = { close: 0, wider: 1, general: 2 };
+const TIER_LABEL = { close: 'Close', wider: 'Wider', general: 'General' };
+const sentDigestsFallback = new Set(); // used only if digest_log is unavailable
+
+function cadenceFor(c) {
+  return c.cadence_days && c.cadence_days > 0 ? c.cadence_days : (TIER_CADENCE[c.tier] ?? TIER_CADENCE.general);
+}
+function daysSinceDate(d) {
+  if (!d) return null;
+  return Math.floor((Date.now() - new Date(d).getTime()) / 86400000);
+}
+function contactState(c) {
+  const d = daysSinceDate(c.last_contact);
+  if (d === null) return 'never';
+  const cad = cadenceFor(c);
+  if (d > cad) return 'overdue';
+  if (d > cad - 4) return 'due-soon';
+  return 'good';
+}
+// Birthdays are stored as either YYYY-MM-DD or MM-DD — read the last two segments
+// so both shapes work.
+function birthdayDaysLeft(bday) {
+  if (!bday) return null;
+  const parts = String(bday).split('-').map(Number);
+  if (parts.length < 2) return null;
+  const m = parts[parts.length - 2];
+  const d = parts[parts.length - 1];
+  if (!m || !d || Number.isNaN(m) || Number.isNaN(d)) return null;
+  const now = new Date();
+  const b = new Date(now.getFullYear(), m - 1, d);
+  if (b < now) b.setFullYear(now.getFullYear() + 1);
+  return Math.ceil((b.getTime() - now.getTime()) / 86400000);
+}
+function isoWeekKey(date = new Date()) {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil(((d - yearStart) / 86400000 + 1) / 7);
+  return `${d.getUTCFullYear()}-W${String(weekNo).padStart(2, '0')}`;
+}
+
+function buildDigest(contacts) {
+  const overdue = [], dueSoon = [], never = [], birthdays = [], tasks = [];
+  const today = new Date().toISOString().slice(0, 10);
+  const weekEnd = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+
+  for (const c of contacts) {
+    const state = contactState(c);
+    const d = daysSinceDate(c.last_contact);
+    if (state === 'overdue') overdue.push({ ...c, daysOverdue: d - cadenceFor(c), days: d });
+    else if (state === 'due-soon') dueSoon.push({ ...c, daysLeft: cadenceFor(c) - d });
+    else if (state === 'never') never.push(c);
+
+    const bd = birthdayDaysLeft(c.birthday);
+    if (bd !== null && bd <= 14) birthdays.push({ name: c.name, days: bd });
+
+    for (const t of (Array.isArray(c.tasks_json) ? c.tasks_json : [])) {
+      if (!t.done && t.due && t.due <= weekEnd) {
+        tasks.push({ content: t.content, due: t.due, contactName: c.name, isOverdue: t.due < today });
+      }
+    }
+  }
+
+  // Close relationships matter most, then by how far past cadence they are. Someone
+  // with hundreds of stale general contacts should still see their close circle first.
+  overdue.sort((a, b) => (TIER_RANK[a.tier] ?? 3) - (TIER_RANK[b.tier] ?? 3) || b.daysOverdue - a.daysOverdue);
+  dueSoon.sort((a, b) => a.daysLeft - b.daysLeft);
+  birthdays.sort((a, b) => a.days - b.days);
+  tasks.sort((a, b) => a.due.localeCompare(b.due));
+
+  const hasContent = overdue.length + dueSoon.length + birthdays.length + tasks.length > 0;
+  return { overdue, dueSoon, never, birthdays, tasks, hasContent };
+}
+
+function renderDigestHtml(digest, contactCount) {
+  const S = {
+    wrap: 'max-width:560px;margin:0 auto;padding:32px 24px;font-family:Inter,-apple-system,Segoe UI,sans-serif;color:#0F172A;background:#ffffff;',
+    h1: 'margin:0 0 4px;font-size:20px;font-weight:600;letter-spacing:-0.02em;color:#0F172A;',
+    sub: 'margin:0 0 28px;font-size:13px;color:#64748B;',
+    label: 'margin:28px 0 10px;font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#64748B;',
+    row: 'padding:10px 0;border-bottom:1px solid #E2E8F0;font-size:14px;',
+    name: 'font-weight:600;color:#0F172A;',
+    meta: 'color:#64748B;font-size:12px;',
+    cta: 'display:inline-block;margin-top:28px;padding:10px 20px;background:#2563EB;color:#ffffff;text-decoration:none;border-radius:4px;font-size:14px;font-weight:500;',
+    more: 'padding-top:10px;font-size:12px;color:#64748B;',
+  };
+  const section = (title, rows, extra) => rows.length === 0 ? '' :
+    `<div style="${S.label}">${title}</div>${rows.join('')}${extra || ''}`;
+
+  const parts = [];
+
+  if (digest.overdue.length) {
+    const shown = digest.overdue.slice(0, 8).map(c =>
+      `<div style="${S.row}"><span style="${S.name}">${esc(c.name)}</span>` +
+      `${c.role ? ` <span style="${S.meta}">· ${esc(c.role)}</span>` : ''}` +
+      `<br><span style="${S.meta}">${c.days} days since contact · ${c.daysOverdue}d past your ${TIER_LABEL[c.tier] ?? ''} cadence</span></div>`
+    );
+    const rest = digest.overdue.length - shown.length;
+    parts.push(section('Going cold', shown, rest > 0 ? `<div style="${S.more}">+ ${rest} more overdue</div>` : ''));
+  }
+
+  if (digest.dueSoon.length) {
+    const shown = digest.dueSoon.slice(0, 5).map(c =>
+      `<div style="${S.row}"><span style="${S.name}">${esc(c.name)}</span>` +
+      `<br><span style="${S.meta}">due in ${c.daysLeft} day${c.daysLeft === 1 ? '' : 's'}</span></div>`
+    );
+    parts.push(section('Coming up', shown));
+  }
+
+  if (digest.birthdays.length) {
+    const shown = digest.birthdays.slice(0, 5).map(b =>
+      `<div style="${S.row}"><span style="${S.name}">${esc(b.name)}</span>` +
+      `<br><span style="${S.meta}">${b.days === 0 ? 'birthday today' : `birthday in ${b.days} day${b.days === 1 ? '' : 's'}`}</span></div>`
+    );
+    parts.push(section('Birthdays', shown));
+  }
+
+  if (digest.tasks.length) {
+    const shown = digest.tasks.slice(0, 8).map(t =>
+      `<div style="${S.row}"><span style="${S.name}">${esc(t.content)}</span>` +
+      `<br><span style="${S.meta}">${esc(t.contactName)} · ${t.isOverdue ? 'overdue' : 'due'} ${t.due}</span></div>`
+    );
+    parts.push(section('Tasks this week', shown));
+  }
+
+  if (!parts.length) {
+    parts.push(`<div style="${S.row}">Nothing needs attention this week — every relationship is within its cadence.</div>`);
+  }
+
+  const headline = digest.overdue.length
+    ? `${digest.overdue.length} relationship${digest.overdue.length === 1 ? '' : 's'} need${digest.overdue.length === 1 ? 's' : ''} attention`
+    : 'Your week ahead';
+
+  return `<div style="${S.wrap}">` +
+    `<h1 style="${S.h1}">${headline}</h1>` +
+    `<p style="${S.sub}">Across ${contactCount} contact${contactCount === 1 ? '' : 's'}` +
+    `${digest.never.length ? ` · ${digest.never.length} never contacted` : ''}</p>` +
+    parts.join('') +
+    `<a href="${FRONTEND_URL}" style="${S.cta}">Open The Relationship Engine</a>` +
+    `</div>`;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+}
+
+// Always resolve contacts by the target user's own id — never a shared or default scope.
+async function sendDigestForUser(userId, email, { force = false } = {}) {
+  if (!email) return { sent: false, reason: 'no email' };
+  const contacts = await sbGet(`contacts?user_id=eq.${userId}&archived=eq.false&select=id,name,role,tier,last_contact,birthday,cadence_days,tasks_json`);
+  if (!contacts.length) return { sent: false, reason: 'no contacts' };
+
+  const digest = buildDigest(contacts);
+  if (!digest.hasContent && !force) return { sent: false, reason: 'nothing to report' };
+
+  await sendEmail({
+    to: email,
+    subject: digest.overdue.length
+      ? `${digest.overdue.length} relationship${digest.overdue.length === 1 ? '' : 's'} need attention this week`
+      : 'Your relationships this week',
+    html: renderDigestHtml(digest, contacts.length),
+  });
+  return { sent: true, counts: { overdue: digest.overdue.length, dueSoon: digest.dueSoon.length, birthdays: digest.birthdays.length, tasks: digest.tasks.length } };
+}
+
+async function listAuthUsers() {
+  const users = [];
+  for (let page = 1; page <= 20; page++) {
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/admin/users?page=${page}&per_page=200`, {
+      headers: { Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`, apikey: SUPABASE_SERVICE_KEY }
+    });
+    if (!r.ok) throw new Error(`Supabase admin users failed: ${r.status} ${await r.text()}`);
+    const d = await r.json();
+    const batch = d.users ?? [];
+    users.push(...batch);
+    if (batch.length < 200) break;
+  }
+  return users;
+}
+
+async function digestAlreadySent(userId, weekKey) {
+  try {
+    const rows = await sbGet(`digest_log?user_id=eq.${userId}&week_key=eq.${encodeURIComponent(weekKey)}&select=user_id`);
+    return rows.length > 0;
+  } catch (err) {
+    console.error('digest_log read failed, falling back to in-memory dedupe:', err.message);
+    return sentDigestsFallback.has(`${userId}:${weekKey}`);
+  }
+}
+
+async function markDigestSent(userId, weekKey) {
+  sentDigestsFallback.add(`${userId}:${weekKey}`);
+  try {
+    await sbPost('digest_log', { user_id: userId, week_key: weekKey });
+  } catch (err) {
+    console.error('digest_log write failed (dedupe is in-memory only this run):', err.message);
+  }
+}
+
+async function digestTick() {
+  try {
+    const now = new Date();
+    if (now.getUTCDay() !== DIGEST_DAY || now.getUTCHours() !== DIGEST_HOUR_UTC) return;
+    const weekKey = isoWeekKey(now);
+    const users = await listAuthUsers();
+    console.log(`Digest run ${weekKey}: ${users.length} users`);
+    for (const u of users) {
+      try {
+        if (await digestAlreadySent(u.id, weekKey)) continue;
+        const result = await sendDigestForUser(u.id, u.email);
+        // Mark regardless of whether an email went out, so users with nothing to
+        // report aren't re-evaluated every hour of the send window.
+        await markDigestSent(u.id, weekKey);
+        if (result.sent) console.log(`Digest sent to ${u.id}`);
+      } catch (err) {
+        console.error(`Digest failed for user ${u.id}:`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error('Digest tick failed:', err);
+  }
+}
+
+// Always use supabase.auth.getUser(). Never hardcode user IDs.
+app.post('/api/digest/send-me', requireAuth, async (req, res) => {
+  try {
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${req.userId}`, {
+      headers: { Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`, apikey: SUPABASE_SERVICE_KEY }
+    });
+    if (!r.ok) return res.status(500).json({ error: 'Could not resolve your account email' });
+    const user = await r.json();
+    const result = await sendDigestForUser(req.userId, user.email, { force: true });
+    if (!result.sent) return res.status(400).json({ error: result.reason === 'no contacts' ? 'You have no contacts yet.' : 'Nothing to send.' });
+    res.json({ success: true, sentTo: user.email, ...result });
+  } catch (err) {
+    console.error('Error in /api/digest/send-me:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
+
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`RE API running on port ${PORT}`);
+    setTimeout(healthTick, 60 * 1000).unref?.();
+    setInterval(healthTick, HEALTH_INTERVAL_MS);
+    setInterval(digestTick, DIGEST_TICK_MS);
+  });
+}
+
+module.exports = { buildDigest, renderDigestHtml, contactState, cadenceFor, birthdayDaysLeft, isoWeekKey };
