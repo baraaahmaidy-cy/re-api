@@ -430,7 +430,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
   } catch (err) {
     console.error('Error in /api/telegram-webhook:', err);
     if (chatId) await sendTelegramMessage(chatId, `[debug] ${err.message}`).catch(() => {});
-    res.status(200).json({ ok: true }); // 200 so Telegram doesn't retry indefinitely
+    res.status(200).json({ ok: true, debug: String(err?.message || err) }); // 200 so Telegram doesn't retry indefinitely
   }
 });
 
