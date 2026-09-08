@@ -382,10 +382,11 @@ app.post('/api/telegram/disconnect', requireAuth, async (req, res) => {
 // never from message text — and every contacts query below is scoped with .eq('user_id', userId)
 // since the service role key bypasses RLS. Never remove these filters.
 app.post('/api/telegram-webhook', async (req, res) => {
+  let chatId;
   try {
     const message = req.body?.message;
     if (!message?.text) return res.status(200).json({ ok: true });
-    const chatId = String(message.chat.id);
+    chatId = String(message.chat.id);
     const text = message.text.trim();
     const username = message.from?.username || null;
 
@@ -428,6 +429,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('Error in /api/telegram-webhook:', err);
+    if (chatId) await sendTelegramMessage(chatId, `[debug] ${err.message}`).catch(() => {});
     res.status(200).json({ ok: true }); // 200 so Telegram doesn't retry indefinitely
   }
 });
