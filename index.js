@@ -142,6 +142,7 @@ Respond with ONLY the JSON object, no other text.`;
     body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 300 })
   });
   const data = await response.json();
+  if (!response.ok) throw new Error(`Groq classify failed: ${response.status} ${JSON.stringify(data)}`);
   const content = data.choices?.[0]?.message?.content || '{}';
   const jsonMatch = content.match(/\{[\s\S]*\}/);
   try {
