@@ -22,6 +22,14 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PORT = process.env.PORT || 3001;
 
+// Overridable via env so a deprecated model can be swapped without a code deploy —
+// llama-3.3-70b-versatile was removed by Groq and silently broke every AI feature.
+const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+const API_URL = 'https://api.therelationshipengine.xyz';
+const FRONTEND_URL = 'https://therelationshipengine.xyz';
+const TELEGRAM_WEBHOOK_URL = `${API_URL}/api/telegram-webhook`;
+const ALERT_EMAIL = process.env.ALERT_EMAIL || 'baraaahmaidy@gmail.com';
+
 // ── Supabase REST helpers (service role — every call below scopes by user_id explicitly) ──
 async function sbGet(path) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
@@ -139,7 +147,7 @@ Respond with ONLY the JSON object, no other text.`;
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'openai/gpt-oss-120b', messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 300 })
+    body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 300 })
   });
   const data = await response.json();
   if (!response.ok) throw new Error(`Groq classify failed: ${response.status} ${JSON.stringify(data)}`);
@@ -274,7 +282,7 @@ app.post('/api/suggest', async (req, res) => {
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'openai/gpt-oss-120b', messages: [{ role: 'user', content: prompt }], temperature: 0.7, max_tokens: 1000 })
+      body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.7, max_tokens: 1000 })
     });
     const data = await response.json();
     const content = data.choices?.[0]?.message?.content;
@@ -449,4 +457,106 @@ app.post('/api/telegram-webhook', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`RE API running on port ${PORT}`));
+// ── Self-monitoring ───────────────────────────────────────────────────────────
+// Every dependency here has silently broken in production at least once with no
+// visible signal: the Groq model was deprecated out from under us, the API's custom
+// domain came unbound from its Railway service, and the Telegram webhook pointed at a
+// dead host. Each check exercises the real dependency rather than trusting config.
+const HEALTH_INTERVAL_MS = 30 * 60 * 1000;
+const ALERT_REPEAT_MS = 6 * 60 * 60 * 1000;
+let health = { ok: null, checkedAt: null, failures: [] };
+let lastAlertAt = 0;
+
+async function runHealthChecks() {
+  const failures = [];
+
+  for (const [label, url] of [['Public API URL', `${API_URL}/`], ['Frontend', `${FRONTEND_URL}/`]]) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+      if (!r.ok) failures.push(`${label} (${url}) returned HTTP ${r.status}`);
+    } catch (err) {
+      failures.push(`${label} (${url}) unreachable: ${err.message}`);
+    }
+  }
+
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: 'Reply with the word OK.' }], max_tokens: 5 }),
+      signal: AbortSignal.timeout(30000)
+    });
+    const d = await r.json();
+    if (!r.ok) failures.push(`Groq model "${GROQ_MODEL}" failed: HTTP ${r.status} ${JSON.stringify(d?.error ?? d).slice(0, 200)}`);
+    else if (!d.choices?.[0]?.message?.content) failures.push(`Groq model "${GROQ_MODEL}" returned no content`);
+  } catch (err) {
+    failures.push(`Groq unreachable: ${err.message}`);
+  }
+
+  try {
+    await sbGet('contacts?select=id&limit=1');
+  } catch (err) {
+    failures.push(`Supabase query failed: ${err.message.slice(0, 200)}`);
+  }
+
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo`, { signal: AbortSignal.timeout(15000) });
+    const d = await r.json();
+    const registered = d?.result?.url;
+    if (registered !== TELEGRAM_WEBHOOK_URL) failures.push(`Telegram webhook is "${registered || 'unset'}", expected "${TELEGRAM_WEBHOOK_URL}"`);
+    if (d?.result?.last_error_message) failures.push(`Telegram webhook delivery error: ${d.result.last_error_message}`);
+  } catch (err) {
+    failures.push(`Telegram webhook check failed: ${err.message}`);
+  }
+
+  return failures;
+}
+
+async function sendAlertEmail(subject, html) {
+  if (!RESEND_FULL_ACCESS_KEY) return;
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${RESEND_FULL_ACCESS_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: 'The Relationship Engine <noreply@therelationshipengine.xyz>', to: [ALERT_EMAIL], subject, html })
+  });
+  if (!r.ok) console.error('Health alert email failed:', r.status, await r.text());
+}
+
+async function healthTick() {
+  try {
+    const failures = await runHealthChecks();
+    const wasOk = health.ok;
+    health = { ok: failures.length === 0, checkedAt: new Date().toISOString(), failures };
+
+    if (failures.length > 0) {
+      // Alert on the transition into failure, then at most once every ALERT_REPEAT_MS
+      // while it stays broken, so an ongoing outage doesn't bury the inbox.
+      const isNew = wasOk !== false;
+      if (isNew || Date.now() - lastAlertAt > ALERT_REPEAT_MS) {
+        lastAlertAt = Date.now();
+        await sendAlertEmail(
+          'The Relationship Engine — health check failed',
+          `<p>The following checks are failing:</p><ul>${failures.map(f => `<li>${f}</li>`).join('')}</ul><p>Checked at ${health.checkedAt}</p>`
+        );
+      }
+    } else if (wasOk === false) {
+      lastAlertAt = 0;
+      await sendAlertEmail(
+        'The Relationship Engine — recovered',
+        `<p>All health checks are passing again as of ${health.checkedAt}.</p>`
+      );
+    }
+  } catch (err) {
+    console.error('Health check tick failed:', err);
+  }
+}
+
+app.get('/api/health', (req, res) => {
+  res.status(health.ok === false ? 503 : 200).json(health);
+});
+
+app.listen(PORT, () => {
+  console.log(`RE API running on port ${PORT}`);
+  setTimeout(healthTick, 60 * 1000).unref?.();
+  setInterval(healthTick, HEALTH_INTERVAL_MS);
+});
