@@ -109,7 +109,19 @@ async function tryLinkTelegram(code, chatId, username) {
 
 // Voice notes are the point of the Telegram surface: speaking a note while walking
 // out of a meeting is the lowest-friction way to keep a CRM current.
-async function transcribeTelegramVoice(fileId) {
+// Groq accepts a fixed set of audio extensions. Telegram serves voice notes from a
+// path ending in .oga, which is NOT on that list even though the container is ogg —
+// so the filename is derived from the mime type rather than passed through.
+const AUDIO_EXT_BY_MIME = {
+  'audio/ogg': 'ogg', 'audio/oga': 'ogg', 'audio/opus': 'ogg', 'audio/vorbis': 'ogg',
+  'audio/mpeg': 'mp3', 'audio/mp3': 'mp3',
+  'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/aac': 'm4a',
+  'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/wave': 'wav',
+  'audio/webm': 'webm', 'audio/flac': 'flac', 'audio/x-flac': 'flac',
+};
+
+async function transcribeTelegramVoice(voice) {
+  const fileId = voice.file_id;
   const infoRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`, { signal: AbortSignal.timeout(15000) });
   const info = await infoRes.json();
   const filePath = info?.result?.file_path;
@@ -119,8 +131,11 @@ async function transcribeTelegramVoice(fileId) {
   if (!audioRes.ok) throw new Error(`Telegram file download failed: ${audioRes.status}`);
   const audio = await audioRes.arrayBuffer();
 
+  const mime = voice.mime_type || 'audio/ogg';
+  const ext = AUDIO_EXT_BY_MIME[mime.split(';')[0].trim().toLowerCase()] || 'ogg';
+
   const form = new FormData();
-  form.append('file', new Blob([audio]), filePath.split('/').pop() || 'voice.ogg');
+  form.append('file', new Blob([audio], { type: mime }), `voice.${ext}`);
   form.append('model', GROQ_TRANSCRIBE_MODEL);
   form.append('response_format', 'json');
 
@@ -497,10 +512,10 @@ app.post('/api/telegram-webhook', async (req, res) => {
     if (voice) {
       await sendTelegramAction(chatId, 'typing');
       try {
-        transcript = await transcribeTelegramVoice(voice.file_id);
+        transcript = await transcribeTelegramVoice(voice);
       } catch (err) {
         console.error('Voice transcription failed:', err);
-        await sendTelegramMessage(chatId, "I couldn't make out that voice note — try again, or type it instead.");
+        await sendTelegramMessage(chatId, `I couldn't make out that voice note — try again, or type it instead.\n\n[debug] ${String(err.message).slice(0, 400)}`);
         return res.json({ ok: true });
       }
       if (!transcript) {
