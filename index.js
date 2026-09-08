@@ -305,17 +305,20 @@ app.post('/api/invite-member', async (req, res) => {
     if (!userResponse.ok) return res.status(401).json({ error: 'Invalid token' });
     const userData = await userResponse.json();
     const userId = userData.id;
-    const roleResponse = await fetch(`${SUPABASE_URL}/rest/v1/org_members?user_id=eq.${userId}&select=role`, {
+    const roleResponse = await fetch(`${SUPABASE_URL}/rest/v1/org_members?user_id=eq.${userId}&select=role,org_id`, {
       headers: { 'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`, 'apikey': SUPABASE_SERVICE_KEY }
     });
     const roleData = await roleResponse.json();
-    if (roleData?.[0]?.role !== 'manager') return res.status(403).json({ error: 'Only managers can invite members' });
-    const { email, orgId } = req.body;
-    if (!email || !orgId) return res.status(400).json({ error: 'email and orgId are required' });
+    const membership = roleData?.[0];
+    if (membership?.role !== 'manager') return res.status(403).json({ error: 'Only managers can invite members' });
+    const orgId = membership.org_id;
+    const { email, role } = req.body;
+    if (!email) return res.status(400).json({ error: 'email is required' });
+    const inviteRole = role === 'manager' ? 'manager' : 'member';
     await fetch(`${SUPABASE_URL}/rest/v1/team_invitations`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`, 'apikey': SUPABASE_SERVICE_KEY, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
-      body: JSON.stringify({ email, org_id: orgId, invited_by: userId, status: 'pending' })
+      body: JSON.stringify({ email, org_id: orgId, role: inviteRole, invited_by: userId, status: 'pending' })
     });
     await fetch('https://api.resend.com/emails', {
       method: 'POST',
