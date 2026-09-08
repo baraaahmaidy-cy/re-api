@@ -70,6 +70,16 @@ function generateLinkingCode() {
   return code;
 }
 
+// Validates + consumes a linking code, creating the telegram_links row. Returns true on success.
+async function tryLinkTelegram(code, chatId, username) {
+  const rows = await sbGet(`linking_codes?code=eq.${encodeURIComponent(code)}&used=eq.false&select=*`);
+  const row = rows?.[0];
+  if (!row || new Date(row.expires_at) < new Date()) return false;
+  await sbPost('telegram_links', { user_id: row.user_id, telegram_chat_id: chatId, telegram_username: username, status: 'active' });
+  await sbPatch(`linking_codes?code=eq.${encodeURIComponent(code)}`, { used: true });
+  return true;
+}
+
 async function sendTelegramMessage(chatId, text) {
   if (!TELEGRAM_BOT_TOKEN) return;
   await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -382,23 +392,30 @@ app.post('/api/telegram-webhook', async (req, res) => {
     if (text.startsWith('/start')) {
       const code = text.replace('/start', '').trim().toUpperCase();
       if (!code) {
-        await sendTelegramMessage(chatId, "Welcome! Get your linking code from The Relationship Engine app under Settings → Connect Telegram.");
+        await sendTelegramMessage(chatId, "Send me your 6-character linking code from The Relationship Engine app (Settings → Connect Telegram) to get started.");
         return res.json({ ok: true });
       }
-      const rows = await sbGet(`linking_codes?code=eq.${encodeURIComponent(code)}&used=eq.false&select=*`);
-      const row = rows?.[0];
-      if (!row || new Date(row.expires_at) < new Date()) {
-        await sendTelegramMessage(chatId, "That code is invalid or expired. Generate a new one in Settings.");
-        return res.json({ ok: true });
-      }
-      await sbPost('telegram_links', { user_id: row.user_id, telegram_chat_id: chatId, telegram_username: username, status: 'active' });
-      await sbPatch(`linking_codes?code=eq.${encodeURIComponent(code)}`, { used: true });
-      await sendTelegramMessage(chatId, `You're connected! Send me things like "had a call with Ahmad today" or "note for Sarah: launching next month" and I'll log them.`);
+      const linked = await tryLinkTelegram(code, chatId, username);
+      await sendTelegramMessage(chatId, linked
+        ? `You're connected! Send me things like "had a call with Ahmad today" or "note for Sarah: launching next month" and I'll log them.`
+        : "That code is invalid or expired. Generate a new one in Settings.");
       return res.json({ ok: true });
     }
 
     const linkRows = await sbGet(`telegram_links?telegram_chat_id=eq.${encodeURIComponent(chatId)}&status=eq.active&select=user_id`);
-    const userId = linkRows?.[0]?.user_id;
+    let userId = linkRows?.[0]?.user_id;
+
+    // Not linked yet — if the message looks like a bare linking code (e.g. sent as a
+    // follow-up to /start rather than combined with it, which Telegram only auto-combines
+    // on a brand-new chat), try it as a linking attempt before giving up.
+    if (!userId && /^[A-Z2-9]{6}$/.test(text.toUpperCase())) {
+      const linked = await tryLinkTelegram(text.toUpperCase(), chatId, username);
+      if (linked) {
+        await sendTelegramMessage(chatId, `You're connected! Send me things like "had a call with Ahmad today" or "note for Sarah: launching next month" and I'll log them.`);
+        return res.json({ ok: true });
+      }
+    }
+
     if (!userId) {
       await sendTelegramMessage(chatId, "You're not linked yet. Go to Settings → Connect Telegram in the app to get a code.");
       return res.json({ ok: true });
