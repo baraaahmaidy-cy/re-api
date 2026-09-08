@@ -625,6 +625,10 @@ function isoWeekKey(date = new Date()) {
 
 function buildDigest(contacts) {
   const overdue = [], dueSoon = [], never = [], birthdays = [], tasks = [];
+  // Never-contacted splits in two: someone deliberately tiered close/wider and never
+  // reached is a real signal, while a bulk-imported general contact is just an address
+  // book entry. Nudging on the latter would bury the former in noise.
+  const neverTiered = [];
   const today = new Date().toISOString().slice(0, 10);
   const weekEnd = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
 
@@ -633,7 +637,10 @@ function buildDigest(contacts) {
     const d = daysSinceDate(c.last_contact);
     if (state === 'overdue') overdue.push({ ...c, daysOverdue: d - cadenceFor(c), days: d });
     else if (state === 'due-soon') dueSoon.push({ ...c, daysLeft: cadenceFor(c) - d });
-    else if (state === 'never') never.push(c);
+    else if (state === 'never') {
+      never.push(c);
+      if (c.tier === 'close' || c.tier === 'wider') neverTiered.push(c);
+    }
 
     const bd = birthdayDaysLeft(c.birthday);
     if (bd !== null && bd <= 14) birthdays.push({ name: c.name, days: bd });
@@ -651,9 +658,11 @@ function buildDigest(contacts) {
   dueSoon.sort((a, b) => a.daysLeft - b.daysLeft);
   birthdays.sort((a, b) => a.days - b.days);
   tasks.sort((a, b) => a.due.localeCompare(b.due));
+  neverTiered.sort((a, b) => (TIER_RANK[a.tier] ?? 3) - (TIER_RANK[b.tier] ?? 3) || String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')));
 
-  const hasContent = overdue.length + dueSoon.length + birthdays.length + tasks.length > 0;
-  return { overdue, dueSoon, never, birthdays, tasks, hasContent };
+  const untriaged = never.length - neverTiered.length;
+  const hasContent = overdue.length + dueSoon.length + birthdays.length + tasks.length + neverTiered.length > 0;
+  return { overdue, dueSoon, never, neverTiered, untriaged, birthdays, tasks, hasContent };
 }
 
 function renderDigestHtml(digest, contactCount) {
@@ -691,6 +700,16 @@ function renderDigestHtml(digest, contactCount) {
     parts.push(section('Coming up', shown));
   }
 
+  if (digest.neverTiered.length) {
+    const shown = digest.neverTiered.slice(0, 5).map(c =>
+      `<div style="${S.row}"><span style="${S.name}">${esc(c.name)}</span>` +
+      `${c.role ? ` <span style="${S.meta}">· ${esc(c.role)}</span>` : ''}` +
+      `<br><span style="${S.meta}">in your ${TIER_LABEL[c.tier] ?? ''} circle, never contacted</span></div>`
+    );
+    const rest = digest.neverTiered.length - shown.length;
+    parts.push(section('Never reached out', shown, rest > 0 ? `<div style="${S.more}">+ ${rest} more</div>` : ''));
+  }
+
   if (digest.birthdays.length) {
     const shown = digest.birthdays.slice(0, 5).map(b =>
       `<div style="${S.row}"><span style="${S.name}">${esc(b.name)}</span>` +
@@ -715,11 +734,17 @@ function renderDigestHtml(digest, contactCount) {
     ? `${digest.overdue.length} relationship${digest.overdue.length === 1 ? '' : 's'} need${digest.overdue.length === 1 ? 's' : ''} attention`
     : 'Your week ahead';
 
+  // Untriaged contacts are the real blocker when they dominate: the cadence engine
+  // can't track anyone still sitting in the default general tier.
+  const triageNote = digest.untriaged >= 25
+    ? `<div style="${S.more}">${digest.untriaged} imported contacts are still untiered — sorting a few into Close or Wider lets them show up here.</div>`
+    : '';
+
   return `<div style="${S.wrap}">` +
     `<h1 style="${S.h1}">${headline}</h1>` +
-    `<p style="${S.sub}">Across ${contactCount} contact${contactCount === 1 ? '' : 's'}` +
-    `${digest.never.length ? ` · ${digest.never.length} never contacted` : ''}</p>` +
+    `<p style="${S.sub}">Across ${contactCount} contact${contactCount === 1 ? '' : 's'}</p>` +
     parts.join('') +
+    triageNote +
     `<a href="${FRONTEND_URL}" style="${S.cta}">Open The Relationship Engine</a>` +
     `</div>`;
 }
@@ -735,7 +760,7 @@ function renderDigestText(digest, contactCount) {
   lines.push(digest.overdue.length
     ? `${digest.overdue.length} relationship${digest.overdue.length === 1 ? '' : 's'} need attention`
     : 'Your week ahead');
-  lines.push(`Across ${contactCount} contact${contactCount === 1 ? '' : 's'}${digest.never.length ? ` - ${digest.never.length} never contacted` : ''}`);
+  lines.push(`Across ${contactCount} contact${contactCount === 1 ? '' : 's'}`);
 
   if (digest.overdue.length) {
     lines.push('', 'GOING COLD');
@@ -749,6 +774,14 @@ function renderDigestText(digest, contactCount) {
     lines.push('', 'COMING UP');
     for (const c of digest.dueSoon.slice(0, 5)) lines.push(`- ${c.name}: due in ${c.daysLeft} day${c.daysLeft === 1 ? '' : 's'}`);
   }
+  if (digest.neverTiered.length) {
+    lines.push('', 'NEVER REACHED OUT');
+    for (const c of digest.neverTiered.slice(0, 5)) {
+      lines.push(`- ${c.name}${c.role ? ` (${c.role})` : ''}: in your ${TIER_LABEL[c.tier] ?? ''} circle, never contacted`);
+    }
+    const rest = digest.neverTiered.length - Math.min(5, digest.neverTiered.length);
+    if (rest > 0) lines.push(`  + ${rest} more`);
+  }
   if (digest.birthdays.length) {
     lines.push('', 'BIRTHDAYS');
     for (const b of digest.birthdays.slice(0, 5)) lines.push(`- ${b.name}: ${b.days === 0 ? 'today' : `in ${b.days} day${b.days === 1 ? '' : 's'}`}`);
@@ -759,6 +792,9 @@ function renderDigestText(digest, contactCount) {
   }
   if (!digest.hasContent) {
     lines.push('', 'Nothing needs attention this week - every relationship is within its cadence.');
+  }
+  if (digest.untriaged >= 25) {
+    lines.push('', `${digest.untriaged} imported contacts are still untiered - sorting a few into Close or Wider lets them show up here.`);
   }
   lines.push('', `Open The Relationship Engine: ${FRONTEND_URL}`);
   return lines.join('\n');
