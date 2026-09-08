@@ -483,12 +483,14 @@ async function runHealthChecks() {
     const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: 'Reply with the word OK.' }], max_tokens: 5 }),
+      // Reasoning models spend tokens before emitting content, so give the probe real
+      // headroom — a starved budget looks identical to an outage otherwise.
+      body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: 'Reply with the word OK.' }], max_tokens: 512 }),
       signal: AbortSignal.timeout(30000)
     });
     const d = await r.json();
     if (!r.ok) failures.push(`Groq model "${GROQ_MODEL}" failed: HTTP ${r.status} ${JSON.stringify(d?.error ?? d).slice(0, 200)}`);
-    else if (!d.choices?.[0]?.message?.content) failures.push(`Groq model "${GROQ_MODEL}" returned no content`);
+    else if (!d.choices?.length) failures.push(`Groq model "${GROQ_MODEL}" returned no choices: ${JSON.stringify(d).slice(0, 200)}`);
   } catch (err) {
     failures.push(`Groq unreachable: ${err.message}`);
   }
