@@ -278,7 +278,7 @@ app.post('/api/suggest', async (req, res) => {
     });
     const data = await response.json();
     const content = data.choices?.[0]?.message?.content;
-    if (!content) return res.status(500).json({ error: 'No response from AI' });
+    if (!content) return res.status(500).json({ error: 'No response from AI', debug: { status: response.status, data } });
     const jsonMatch = content.match(/\[[\s\S]*\]/);
     const suggestions = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
     res.json({ suggestions });
