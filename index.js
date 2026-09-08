@@ -25,6 +25,7 @@ const PORT = process.env.PORT || 3001;
 // Overridable via env so a deprecated model can be swapped without a code deploy —
 // llama-3.3-70b-versatile was removed by Groq and silently broke every AI feature.
 const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+const GROQ_TRANSCRIBE_MODEL = process.env.GROQ_TRANSCRIBE_MODEL || 'whisper-large-v3-turbo';
 const API_URL = 'https://api.therelationshipengine.xyz';
 const FRONTEND_URL = 'https://therelationshipengine.xyz';
 const TELEGRAM_WEBHOOK_URL = `${API_URL}/api/telegram-webhook`;
@@ -106,6 +107,34 @@ async function tryLinkTelegram(code, chatId, username) {
   return true;
 }
 
+// Voice notes are the point of the Telegram surface: speaking a note while walking
+// out of a meeting is the lowest-friction way to keep a CRM current.
+async function transcribeTelegramVoice(fileId) {
+  const infoRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`, { signal: AbortSignal.timeout(15000) });
+  const info = await infoRes.json();
+  const filePath = info?.result?.file_path;
+  if (!filePath) throw new Error(`Telegram getFile failed: ${JSON.stringify(info).slice(0, 200)}`);
+
+  const audioRes = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`, { signal: AbortSignal.timeout(30000) });
+  if (!audioRes.ok) throw new Error(`Telegram file download failed: ${audioRes.status}`);
+  const audio = await audioRes.arrayBuffer();
+
+  const form = new FormData();
+  form.append('file', new Blob([audio]), filePath.split('/').pop() || 'voice.ogg');
+  form.append('model', GROQ_TRANSCRIBE_MODEL);
+  form.append('response_format', 'json');
+
+  const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+    body: form,
+    signal: AbortSignal.timeout(60000)
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(`Groq transcription failed: ${r.status} ${JSON.stringify(d?.error ?? d).slice(0, 200)}`);
+  return (d.text || '').trim();
+}
+
 async function sendTelegramMessage(chatId, text) {
   if (!TELEGRAM_BOT_TOKEN) return;
   await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -113,6 +142,18 @@ async function sendTelegramMessage(chatId, text) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, text })
   });
+}
+
+// Transcription takes a few seconds; show the typing indicator so it doesn't look dead.
+async function sendTelegramAction(chatId, action) {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendChatAction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, action })
+    });
+  } catch { /* cosmetic only */ }
 }
 
 function daysSince(dateStr) {
@@ -412,10 +453,12 @@ app.post('/api/telegram-webhook', async (req, res) => {
   let chatId;
   try {
     const message = req.body?.message;
-    if (!message?.text) return res.status(200).json({ ok: true });
+    if (!message) return res.status(200).json({ ok: true });
     chatId = String(message.chat.id);
-    const text = message.text.trim();
     const username = message.from?.username || null;
+    const voice = message.voice || message.audio || null;
+    let text = (message.text || '').trim();
+    if (!text && !voice) return res.status(200).json({ ok: true });
 
     if (text.startsWith('/start')) {
       const code = text.replace('/start', '').trim().toUpperCase();
@@ -425,7 +468,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
       }
       const linked = await tryLinkTelegram(code, chatId, username);
       await sendTelegramMessage(chatId, linked
-        ? `You're connected! Send me things like "had a call with Ahmad today" or "note for Sarah: launching next month" and I'll log them.`
+        ? `You're connected! Send me things like "had a call with Ahmad today" or "note for Sarah: launching next month" and I'll log them. You can also just send a voice note — I'll transcribe it.`
         : "That code is invalid or expired. Generate a new one in Settings.");
       return res.json({ ok: true });
     }
@@ -436,10 +479,10 @@ app.post('/api/telegram-webhook', async (req, res) => {
     // Not linked yet — if the message looks like a bare linking code (e.g. sent as a
     // follow-up to /start rather than combined with it, which Telegram only auto-combines
     // on a brand-new chat), try it as a linking attempt before giving up.
-    if (!userId && /^[A-Z2-9]{6}$/.test(text.toUpperCase())) {
+    if (!userId && text && /^[A-Z2-9]{6}$/.test(text.toUpperCase())) {
       const linked = await tryLinkTelegram(text.toUpperCase(), chatId, username);
       if (linked) {
-        await sendTelegramMessage(chatId, `You're connected! Send me things like "had a call with Ahmad today" or "note for Sarah: launching next month" and I'll log them.`);
+        await sendTelegramMessage(chatId, `You're connected! Send me things like "had a call with Ahmad today" or "note for Sarah: launching next month" and I'll log them. You can also just send a voice note — I'll transcribe it.`);
         return res.json({ ok: true });
       }
     }
@@ -449,10 +492,29 @@ app.post('/api/telegram-webhook', async (req, res) => {
       return res.json({ ok: true });
     }
 
+    // A voice note becomes text, then follows exactly the same path as a typed message.
+    let transcript = null;
+    if (voice) {
+      await sendTelegramAction(chatId, 'typing');
+      try {
+        transcript = await transcribeTelegramVoice(voice.file_id);
+      } catch (err) {
+        console.error('Voice transcription failed:', err);
+        await sendTelegramMessage(chatId, "I couldn't make out that voice note — try again, or type it instead.");
+        return res.json({ ok: true });
+      }
+      if (!transcript) {
+        await sendTelegramMessage(chatId, "That voice note came through empty — mind sending it again?");
+        return res.json({ ok: true });
+      }
+      text = transcript;
+    }
+
     const contacts = await sbGet(`contacts?user_id=eq.${userId}&archived=eq.false&select=id,name,role,tier,last_contact,last_note,intention,interactions,tasks_json,birthday,cadence_days`);
     const intent = await classifyTelegramIntent(text, contacts);
     const reply = await handleTelegramIntent(intent, userId, contacts, text);
-    await sendTelegramMessage(chatId, reply);
+    // Echo what was heard, so a mis-transcription is obvious rather than silently logged.
+    await sendTelegramMessage(chatId, transcript ? `🎤 "${transcript}"\n\n${reply}` : reply);
     res.json({ ok: true });
   } catch (err) {
     console.error('Error in /api/telegram-webhook:', err);
@@ -497,6 +559,25 @@ async function runHealthChecks() {
     else if (!d.choices?.length) failures.push(`Groq model "${GROQ_MODEL}" returned no choices: ${JSON.stringify(d).slice(0, 200)}`);
   } catch (err) {
     failures.push(`Groq unreachable: ${err.message}`);
+  }
+
+  // The transcription model can't be exercised without an audio file, so check the
+  // catalogue instead — a disappeared model is exactly how the chat model broke.
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/models', {
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+      signal: AbortSignal.timeout(15000)
+    });
+    const d = await r.json();
+    if (!r.ok) failures.push(`Groq model catalogue unreadable: HTTP ${r.status}`);
+    else {
+      const ids = (d.data ?? []).map(m => m.id);
+      if (!ids.includes(GROQ_TRANSCRIBE_MODEL)) {
+        failures.push(`Transcription model "${GROQ_TRANSCRIBE_MODEL}" is no longer in Groq's catalogue — voice notes will fail`);
+      }
+    }
+  } catch (err) {
+    failures.push(`Groq model catalogue check failed: ${err.message}`);
   }
 
   try {
@@ -823,6 +904,16 @@ async function sendDigestForUser(userId, email, { force = false } = {}) {
       'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
     },
   });
+  // If they've linked Telegram, deliver it there too — that's where the logging
+  // habit already lives, and it's one tap from replying with an update.
+  try {
+    const links = await sbGet(`telegram_links?user_id=eq.${userId}&status=eq.active&select=telegram_chat_id&order=linked_at.desc&limit=1`);
+    const chatId = links?.[0]?.telegram_chat_id;
+    if (chatId) await sendTelegramMessage(chatId, renderDigestText(digest, contacts.length));
+  } catch (err) {
+    console.error(`Telegram digest delivery failed for ${userId}:`, err.message);
+  }
+
   return { sent: true, counts: { overdue: digest.overdue.length, dueSoon: digest.dueSoon.length, birthdays: digest.birthdays.length, tasks: digest.tasks.length } };
 }
 
