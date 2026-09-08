@@ -139,7 +139,7 @@ Respond with ONLY the JSON object, no other text.`;
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 300 })
+    body: JSON.stringify({ model: 'openai/gpt-oss-120b', messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 300 })
   });
   const data = await response.json();
   if (!response.ok) throw new Error(`Groq classify failed: ${response.status} ${JSON.stringify(data)}`);
@@ -262,17 +262,6 @@ async function handleTelegramIntent(intent, userId, contacts, rawText) {
   }
 }
 
-// TEMP debug route — lists available Groq model IDs. Remove once the model is fixed.
-app.get('/api/debug/groq-models', async (req, res) => {
-  try {
-    const r = await fetch('https://api.groq.com/openai/v1/models', { headers: { Authorization: `Bearer ${GROQ_API_KEY}` } });
-    const d = await r.json();
-    res.status(r.status).json({ status: r.status, ids: d.data?.map(m => m.id) ?? d });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'The Relationship Engine API' });
 });
@@ -285,11 +274,11 @@ app.post('/api/suggest', async (req, res) => {
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: prompt }], temperature: 0.7, max_tokens: 1000 })
+      body: JSON.stringify({ model: 'openai/gpt-oss-120b', messages: [{ role: 'user', content: prompt }], temperature: 0.7, max_tokens: 1000 })
     });
     const data = await response.json();
     const content = data.choices?.[0]?.message?.content;
-    if (!content) return res.status(500).json({ error: 'No response from AI', debug: { status: response.status, data } });
+    if (!content) return res.status(500).json({ error: 'No response from AI' });
     const jsonMatch = content.match(/\[[\s\S]*\]/);
     const suggestions = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
     res.json({ suggestions });
@@ -455,8 +444,8 @@ app.post('/api/telegram-webhook', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('Error in /api/telegram-webhook:', err);
-    if (chatId) await sendTelegramMessage(chatId, `[debug] ${err.message}`).catch(() => {});
-    res.status(200).json({ ok: true, debug: String(err?.message || err) }); // 200 so Telegram doesn't retry indefinitely
+    if (chatId) await sendTelegramMessage(chatId, "Something went wrong on my end — try again in a moment.").catch(() => {});
+    res.status(200).json({ ok: true }); // 200 so Telegram doesn't retry indefinitely
   }
 });
 
