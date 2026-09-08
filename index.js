@@ -515,7 +515,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
         transcript = await transcribeTelegramVoice(voice);
       } catch (err) {
         console.error('Voice transcription failed:', err);
-        await sendTelegramMessage(chatId, `I couldn't make out that voice note — try again, or type it instead.\n\n[debug] ${String(err.message).slice(0, 400)}`);
+        await sendTelegramMessage(chatId, "I couldn't make out that voice note — try again, or type it instead.");
         return res.json({ ok: true });
       }
       if (!transcript) {
