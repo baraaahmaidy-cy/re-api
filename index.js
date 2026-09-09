@@ -334,25 +334,59 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'The Relationship Engine API' });
 });
 
+// Two shapes, because both live callers send the single-contact one:
+//   { name, role, bio, notes, ... }  → { suggestion: "..." }   (dashboard + detail panel)
+//   { contacts, goal }               → { suggestions: [...] }  (legacy batch form)
+// The single-contact shape used to fall through to a 400 asking for `contacts and
+// goal`, which meant every AI Outreach Suggestion in the app silently failed.
 app.post('/api/suggest', async (req, res) => {
   try {
-    const { contacts, goal } = req.body;
-    if (!contacts || !goal) return res.status(400).json({ error: 'contacts and goal are required' });
-    const prompt = `You are a relationship intelligence assistant for founders using the TAG Framework (Trust, Authority, Generosity).\n\nThe user's goal: "${goal}"\n\nHere are their contacts:\n${JSON.stringify(contacts, null, 2)}\n\nBased on the goal and the contacts' tiers, tags, last interaction dates, and relationship strength, suggest the TOP 3 most relevant contacts to reach out to.\n\nFor each contact provide: name, reason, suggestion. Format as JSON array.`;
+    const { contacts, goal } = req.body || {};
+
+    if (Array.isArray(contacts) && goal) {
+      const prompt = `You are a relationship intelligence assistant for founders using the TAG Framework (Trust, Authority, Generosity).\n\nThe user's goal: "${goal}"\n\nHere are their contacts:\n${JSON.stringify(contacts, null, 2)}\n\nBased on the goal and the contacts' tiers, tags, last interaction dates, and relationship strength, suggest the TOP 3 most relevant contacts to reach out to.\n\nFor each contact provide: name, reason, suggestion. Format as JSON array.`;
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.7, max_tokens: 1000 })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(`Groq failed: HTTP ${response.status} ${JSON.stringify(data).slice(0, 300)}`);
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) throw new Error(`Groq returned no content: ${JSON.stringify(data).slice(0, 300)}`);
+      const jsonMatch = content.match(/\[[\s\S]*\]/);
+      return res.json({ suggestions: jsonMatch ? JSON.parse(jsonMatch[0]) : [] });
+    }
+
+    const c = req.body || {};
+    if (!c.name) return res.status(400).json({ error: 'name (single contact) or contacts+goal is required' });
+
+    // `bio` is the standing "who they are" summary, often read from their LinkedIn
+    // profile. It's the difference between a generic nudge and an opener that
+    // references what the person actually does.
+    const prompt = `You are a relationship intelligence assistant for founders using the TAG Framework (Trust, Authority, Generosity).
+
+Here is one contact:
+${JSON.stringify(c, null, 2)}
+
+Write a single short outreach suggestion — 2 to 3 sentences, addressed to the user (not to the contact) — telling them why to reach out now and what specifically to open with.
+
+Ground it in this contact's actual details: who they are, their recent notes, achievements, interactions, and how long it has been. Be concrete. Never invent facts that are not present above. Do not use headings, bullet points or a greeting — just the suggestion itself.`;
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.7, max_tokens: 1000 })
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.6, max_tokens: 400 })
     });
     const data = await response.json();
+    // Keep the body: a deprecated model reported model_not_found here and the old
+    // generic message hid it completely.
+    if (!response.ok) throw new Error(`Groq failed: HTTP ${response.status} ${JSON.stringify(data).slice(0, 300)}`);
     const content = data.choices?.[0]?.message?.content;
-    if (!content) return res.status(500).json({ error: 'No response from AI' });
-    const jsonMatch = content.match(/\[[\s\S]*\]/);
-    const suggestions = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
-    res.json({ suggestions });
+    if (!content) throw new Error(`Groq returned no content: ${JSON.stringify(data).slice(0, 300)}`);
+    res.json({ suggestion: content.trim() });
   } catch (err) {
     console.error('Error in /api/suggest:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -421,8 +455,9 @@ async function fetchLinkedInProfile(profileUrl) {
 }
 
 // Turns the raw actor payload into the three things a relationship CRM actually
-// wants: what they do, how to file them, and something real to open a conversation
-// with. The raw JSON is far too noisy to put in front of a user.
+// wants: what they do, how to file them, and standing background on who they are.
+// It deliberately does NOT write an outreach line — /api/suggest owns that, and
+// it produces a better one from the bio than a scrape can produce on its own.
 async function summarizeProfile(profile, contactName) {
   const trimmed = JSON.stringify(profile).slice(0, 12000);
   const prompt = `You are a relationship intelligence assistant using the TAG Framework (Trust, Authority, Generosity).
@@ -435,7 +470,7 @@ Return ONLY a JSON object with exactly these keys:
 {
   "role": "their current title at their current company, one short line, empty string if unclear",
   "tags": ["3-6 short lowercase topical tags: industry, function, location, notable affiliations"],
-  "note": "3-5 sentences a founder could actually use before reaching out: what they do now, notable career moves, and one specific non-generic conversation opener grounded in the data above"
+  "bio": "3-5 sentences describing who this person is: what they do now, what they have built or run, the shape of their career, and anything notable about their focus. Write it as standing background a founder would want to know before a conversation. Do NOT write an outreach message, do NOT address them in the second person, and do NOT suggest what to say to them."
 }
 
 Do not invent anything the data does not support. Use an empty string or empty array where data is missing.`;
@@ -461,7 +496,7 @@ Do not invent anything the data does not support. Use an empty string or empty a
     tags: Array.isArray(parsed.tags)
       ? parsed.tags.filter(t => typeof t === 'string' && t.trim()).slice(0, 6).map(t => t.trim().toLowerCase())
       : [],
-    note: typeof parsed.note === 'string' ? parsed.note.trim() : ''
+    bio: typeof parsed.bio === 'string' ? parsed.bio.trim() : ''
   };
 }
 
@@ -485,7 +520,9 @@ app.post('/api/enrich-linkedin', requireAuth, async (req, res) => {
     const cachedRows = await sbGet(`contact_enrichments?user_id=eq.${req.userId}&contact_id=eq.${encodeURIComponent(contactId)}&select=*`);
     const cached = cachedRows?.[0];
     // The point of the cache: same URL, already fetched, costs nothing to serve again.
-    if (cached && cached.linkedin_url === url && !force) {
+    // Entries from before the bio/note rename hold second-person outreach text, which
+    // would read as nonsense in a "who they are" field — those re-fetch once.
+    if (cached && cached.linkedin_url === url && cached.suggestion_json?.bio && !force) {
       return res.json({ suggestion: cached.suggestion_json, cached: true, fetchedAt: cached.fetched_at });
     }
 
