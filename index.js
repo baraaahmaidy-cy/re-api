@@ -371,7 +371,9 @@ ${JSON.stringify(c, null, 2)}
 
 Write a single short outreach suggestion — 2 to 3 sentences, addressed to the user (not to the contact) — telling them why to reach out now and what specifically to open with.
 
-Ground it in this contact's actual details: who they are, their recent notes, achievements, interactions, and how long it has been. Be concrete. Never invent facts that are not present above. Do not use headings, bullet points or a greeting — just the suggestion itself.`;
+Ground it in this contact's actual details: who they are, their recent notes, achievements, interactions, and how long it has been. Be concrete. Never invent facts that are not present above. Do not use headings, bullet points or a greeting — just the suggestion itself.
+
+Refer to the contact by name or as "they"/"them". A name does not tell you someone's gender — never infer pronouns from it. Use "he" or "she" only if the data above explicitly states the person's pronouns or gender.`;
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
@@ -476,7 +478,9 @@ Return ONLY a JSON object with exactly these keys:
   "bio": "3-5 sentences describing who this person is: what they do now, what they have built or run, the shape of their career, and anything notable about their focus. Write it as standing background a founder would want to know before a conversation. Do NOT write an outreach message, do NOT address them in the second person, and do NOT suggest what to say to them."
 }
 
-Do not invent anything the data does not support. Use an empty string or empty array where data is missing.`;
+Do not invent anything the data does not support. Use an empty string or empty array where data is missing.
+
+Refer to the contact by name or as "they"/"them". A name does not tell you someone's gender — never infer pronouns from it. Use "he" or "she" only if the data above explicitly states the person's pronouns or gender.`;
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
