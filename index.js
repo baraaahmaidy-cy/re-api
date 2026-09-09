@@ -207,13 +207,26 @@ Respond with ONLY the JSON object, no other text.`;
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 300 })
+    // Reasoning tokens come out of this budget before any JSON is emitted. At 300
+    // a long voice-note transcript could be cut off mid-object, and the parse
+    // failure below then read as "I didn't understand you" — the bot blaming the
+    // user for its own truncation. The intent object is ~60 tokens; the rest is
+    // headroom, and low effort keeps it from being spent.
+    body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 2000, reasoning_effort: 'low' })
   });
   const data = await response.json();
   if (!response.ok) throw new Error(`Groq classify failed: ${response.status} ${JSON.stringify(data)}`);
-  const content = data.choices?.[0]?.message?.content || '{}';
+  const choice = data.choices?.[0];
+  const content = choice?.message?.content || '';
+  // A truncated or empty completion is our failure, not an unrecognized message.
+  // Throwing sends "something went wrong on my end" instead of quietly telling the
+  // user their perfectly clear instruction made no sense.
+  if (choice?.finish_reason === 'length' || !content.trim()) {
+    throw new Error(`Groq classify returned no usable content (finish_reason=${choice?.finish_reason}): ${JSON.stringify(data).slice(0, 300)}`);
+  }
   const jsonMatch = content.match(/\{[\s\S]*\}/);
   try {
+    // Past here, unrecognized is a real verdict about the message itself.
     return jsonMatch ? JSON.parse(jsonMatch[0]) : { intent: 'unrecognized' };
   } catch {
     return { intent: 'unrecognized' };
