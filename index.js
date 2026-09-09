@@ -356,6 +356,160 @@ app.post('/api/suggest', async (req, res) => {
   }
 });
 
+// ── LinkedIn enrichment (Apify → Groq) ────────────────────────────────────────
+// Always use supabase.auth.getUser(). Never hardcode user IDs.
+//
+// Cost is the governing design constraint: the Apify actor bills per profile
+// fetched, so every path here is arranged to avoid a fetch it doesn't need.
+//   - the URL must parse as a real /in/ profile before anything is called
+//   - a cached result for the same URL returns without touching Apify at all
+//   - maxItems is pinned to 1 so a bad input can never fan out into a bulk run
+//   - the caller passes a contactId, never a URL, so this can't be used as an
+//     open scraping proxy running on someone else's Apify credit
+// Bulk import deliberately never calls this — 892 contacts in one paste would
+// burn a month of credit in a single click.
+const APIFY_TOKEN = process.env.APIFY_TOKEN;
+// Overridable for the same reason as GROQ_MODEL: scraper actors get deprecated
+// or repriced far faster than real APIs, and swapping one shouldn't need a deploy.
+const APIFY_LINKEDIN_ACTOR = process.env.APIFY_LINKEDIN_ACTOR || 'harvestapi~linkedin-profile-scraper';
+// The $4/1k tier. The email-search tier is $10/1k and we collect emails elsewhere.
+const APIFY_SCRAPER_MODE = process.env.APIFY_SCRAPER_MODE || 'Profile details no email ($4 per 1k)';
+
+// Accepts a bare handle, a bare domain path, or a full URL; returns the canonical
+// profile URL, or null when the value isn't a personal profile at all. Company and
+// school pages fall through to null on purpose — the actor can't read them and the
+// call would be billed anyway.
+function normalizeLinkedInUrl(raw) {
+  if (typeof raw !== 'string') return null;
+  const v = raw.trim();
+  if (!v) return null;
+  const slug = /linkedin\.com/i.test(v)
+    ? (v.match(/linkedin\.com\/in\/([^/?#\s]+)/i) || [])[1]
+    : v.replace(/^\/+|\/+$/g, '');
+  if (!slug) return null;
+  let decoded;
+  try { decoded = decodeURIComponent(slug); } catch { decoded = slug; }
+  // LinkedIn slugs allow unicode — Arabic names are common in this network.
+  if (!/^[\wÀ-￿-]{2,100}$/u.test(decoded)) return null;
+  return `https://www.linkedin.com/in/${decoded.toLowerCase()}`;
+}
+
+async function fetchLinkedInProfile(profileUrl) {
+  if (!APIFY_TOKEN) throw new Error('APIFY_TOKEN is not set — add it in Railway → Variables');
+  const endpoint = `https://api.apify.com/v2/acts/${APIFY_LINKEDIN_ACTOR}/run-sync-get-dataset-items`
+    + `?token=${encodeURIComponent(APIFY_TOKEN)}&maxItems=1&timeout=120`;
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ queries: [profileUrl], profileScraperMode: APIFY_SCRAPER_MODE, maxItems: 1 }),
+    signal: AbortSignal.timeout(130000)
+  });
+  const body = await res.text();
+  // Keep the response body in the error — swallowed causes have cost hours here before.
+  if (!res.ok) throw new Error(`Apify actor ${APIFY_LINKEDIN_ACTOR} failed: HTTP ${res.status} ${body.slice(0, 300)}`);
+  let items;
+  try {
+    items = JSON.parse(body);
+  } catch (err) {
+    throw new Error(`Apify returned non-JSON (${err.message}): ${body.slice(0, 200)}`);
+  }
+  const profile = Array.isArray(items) ? items[0] : null;
+  // A run that succeeds with zero items means the profile is private, renamed or
+  // gone. That's a normal outcome, not a failure — the caller reports it as such.
+  if (!profile || profile.error) return null;
+  return profile;
+}
+
+// Turns the raw actor payload into the three things a relationship CRM actually
+// wants: what they do, how to file them, and something real to open a conversation
+// with. The raw JSON is far too noisy to put in front of a user.
+async function summarizeProfile(profile, contactName) {
+  const trimmed = JSON.stringify(profile).slice(0, 12000);
+  const prompt = `You are a relationship intelligence assistant using the TAG Framework (Trust, Authority, Generosity).
+
+Below is scraped LinkedIn data for a contact named "${contactName}".
+
+${trimmed}
+
+Return ONLY a JSON object with exactly these keys:
+{
+  "role": "their current title at their current company, one short line, empty string if unclear",
+  "tags": ["3-6 short lowercase topical tags: industry, function, location, notable affiliations"],
+  "note": "3-5 sentences a founder could actually use before reaching out: what they do now, notable career moves, and one specific non-generic conversation opener grounded in the data above"
+}
+
+Do not invent anything the data does not support. Use an empty string or empty array where data is missing.`;
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.3,
+      max_tokens: 700,
+      response_format: { type: 'json_object' }
+    }),
+    signal: AbortSignal.timeout(45000)
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(`Groq summarize failed: HTTP ${res.status} ${JSON.stringify(data).slice(0, 300)}`);
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) throw new Error(`Groq returned no content: ${JSON.stringify(data).slice(0, 300)}`);
+  const parsed = JSON.parse(content);
+  return {
+    role: typeof parsed.role === 'string' ? parsed.role.trim() : '',
+    tags: Array.isArray(parsed.tags)
+      ? parsed.tags.filter(t => typeof t === 'string' && t.trim()).slice(0, 6).map(t => t.trim().toLowerCase())
+      : [],
+    note: typeof parsed.note === 'string' ? parsed.note.trim() : ''
+  };
+}
+
+// Returns a SUGGESTION. It deliberately does not write to the contact — scraped
+// data is routinely months stale and must never silently overwrite something the
+// user typed themselves. The frontend applies it only on explicit confirmation.
+app.post('/api/enrich-linkedin', requireAuth, async (req, res) => {
+  try {
+    const { contactId, force } = req.body || {};
+    if (!contactId || typeof contactId !== 'string') return res.status(400).json({ error: 'contactId is required' });
+
+    // Scoped by user_id: the service key bypasses RLS, so this filter is the only
+    // thing stopping one user from enriching — and billing against — another's contacts.
+    const rows = await sbGet(`contacts?id=eq.${encodeURIComponent(contactId)}&user_id=eq.${req.userId}&select=id,name,linkedin`);
+    const contact = rows?.[0];
+    if (!contact) return res.status(404).json({ error: 'Contact not found' });
+
+    const url = normalizeLinkedInUrl(contact.linkedin);
+    if (!url) return res.status(400).json({ error: 'This contact has no usable LinkedIn profile URL', code: 'no_url' });
+
+    const cachedRows = await sbGet(`contact_enrichments?user_id=eq.${req.userId}&contact_id=eq.${encodeURIComponent(contactId)}&select=*`);
+    const cached = cachedRows?.[0];
+    // The point of the cache: same URL, already fetched, costs nothing to serve again.
+    if (cached && cached.linkedin_url === url && !force) {
+      return res.json({ suggestion: cached.suggestion_json, cached: true, fetchedAt: cached.fetched_at });
+    }
+
+    const profile = await fetchLinkedInProfile(url);
+    if (!profile) return res.status(404).json({ error: 'No public data found for that profile', code: 'not_found' });
+
+    const suggestion = await summarizeProfile(profile, contact.name);
+
+    await sbUpsert('contact_enrichments', {
+      user_id: req.userId,
+      contact_id: contactId,
+      linkedin_url: url,
+      profile_json: profile,
+      suggestion_json: suggestion,
+      fetched_at: new Date().toISOString()
+    }, 'user_id,contact_id');
+
+    res.json({ suggestion, cached: false, fetchedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error('Error in /api/enrich-linkedin:', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
 app.post('/api/resend-webhook', async (req, res) => {
   try {
     const signature = req.headers['svix-signature'];
