@@ -375,7 +375,10 @@ Ground it in this contact's actual details: who they are, their recent notes, ac
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.6, max_tokens: 400 })
+      // Same reasoning-token trap as summarizeProfile: the suggestion itself is
+      // ~100 tokens, but reasoning is spent from this budget first, and running
+      // out here returns an empty completion rather than an error.
+      body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.6, max_tokens: 2000, reasoning_effort: 'low' })
     });
     const data = await response.json();
     // Keep the body: a deprecated model reported model_not_found here and the old
@@ -481,7 +484,13 @@ Do not invent anything the data does not support. Use an empty string or empty a
       model: GROQ_MODEL,
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.3,
-      max_tokens: 700,
+      // Reasoning tokens are billed against max_tokens BEFORE any output is
+      // emitted, so a budget sized to the answer alone dies mid-document with
+      // "max completion tokens reached before generating a valid document".
+      // The JSON here is ~200 tokens; the rest is headroom for reasoning on a
+      // dense profile. Low effort keeps that headroom from being spent.
+      max_tokens: 3000,
+      reasoning_effort: 'low',
       response_format: { type: 'json_object' }
     }),
     signal: AbortSignal.timeout(45000)
