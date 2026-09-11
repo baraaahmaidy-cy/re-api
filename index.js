@@ -755,6 +755,49 @@ app.post('/api/telegram/disconnect', requireAuth, async (req, res) => {
 // Public Telegram webhook. userId is ALWAYS resolved from telegram_links by telegram_chat_id —
 // never from message text — and every contacts query below is scoped with .eq('user_id', userId)
 // since the service role key bypasses RLS. Never remove these filters.
+// ── LinkedIn links from Telegram → Confirm queue ─────────────────────────────
+// Always use supabase.auth.getUser(). Never hardcode user IDs.
+//
+// Sending profile links to the bot queues each person in pending_contacts; the user
+// confirms them in the app's Confirm tab. Detection is a plain regex, not the
+// classifier: links are unambiguous, several can arrive in one message, and it costs
+// nothing. Names come from the URL slug — deliberately no Apify call, because a batch
+// of links is exactly the bulk path that paid enrichment must never run on.
+const LINKEDIN_URL_RE = /(?:https?:\/\/)?(?:[\w-]+\.)?linkedin\.com\/[^\s<>"'()]+/gi;
+const LNKD_SHORT_RE = /(?:https?:\/\/)?lnkd\.in\/[^\s<>"'()]+/gi;
+const MAX_LINKS_PER_MESSAGE = 50;
+// Trailing slug parts that are qualifications rather than names: "sara-itani-mba".
+const SLUG_CREDENTIALS = new Set(['mba', 'phd', 'cpa', 'cfa', 'pmp', 'msc']);
+
+// "nicolas-gramnea-4b2a1b3" → "Nicolas Gramnea". LinkedIn appends an id to vanity
+// names that were already taken, so trailing parts containing digits are dropped.
+// It's a best guess — the Confirm card lets the user fix it before confirming.
+function nameFromLinkedInUrl(url) {
+  const slug = (url.split('/in/')[1] || '').replace(/\/+$/, '');
+  const parts = slug.split('-').filter(Boolean);
+  while (parts.length > 1 && (/\d/.test(parts[parts.length - 1]) || SLUG_CREDENTIALS.has(parts[parts.length - 1]))) parts.pop();
+  const words = parts.filter(p => !/\d/.test(p));
+  const name = (words.length ? words : parts).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+  return name || slug;
+}
+
+// Pulls every LinkedIn link out of a message: canonical profile URLs (deduped, in
+// order), how many links weren't personal profiles, how many were lnkd.in short
+// links (unresolvable without following LinkedIn's redirect), and the text left
+// once the links are removed.
+function extractLinkedInLinks(text) {
+  const profiles = [];
+  let notProfiles = 0;
+  for (const m of text.match(LINKEDIN_URL_RE) || []) {
+    const url = normalizeLinkedInUrl(m.replace(/[.,;:!?]+$/, ''));
+    if (!url) notProfiles++;
+    else if (!profiles.includes(url)) profiles.push(url);
+  }
+  const shortLinks = (text.match(LNKD_SHORT_RE) || []).length;
+  const leftover = text.replace(LINKEDIN_URL_RE, ' ').replace(LNKD_SHORT_RE, ' ').replace(/\s+/g, ' ').trim();
+  return { profiles, notProfiles, shortLinks, leftover };
+}
+
 app.post('/api/telegram-webhook', async (req, res) => {
   let chatId;
   try {
@@ -814,6 +857,49 @@ app.post('/api/telegram-webhook', async (req, res) => {
         return res.json({ ok: true });
       }
       text = transcript;
+    }
+
+    // LinkedIn profile links go to the Confirm queue rather than the classifier: a
+    // message of bare links gives the model nothing to classify, and several can
+    // arrive at once. Every query below is scoped to this chat's userId.
+    const links = extractLinkedInLinks(text);
+    if (links.profiles.length || links.notProfiles || links.shortLinks) {
+      const lines = [];
+      const profiles = links.profiles.slice(0, MAX_LINKS_PER_MESSAGE);
+      // Text sent alongside the links ("met them at the Doha summit") travels with
+      // each queued person and becomes their first note on confirm.
+      const context = links.leftover.length >= 3 ? links.leftover.slice(0, 1000) : null;
+      if (profiles.length) {
+        // Archived contacts count as known: someone archived isn't someone new.
+        const existing = await sbGet(`contacts?user_id=eq.${userId}&select=name,linkedin`);
+        const known = new Map();
+        for (const c of existing) {
+          const u = normalizeLinkedInUrl(c.linkedin);
+          if (u) known.set(u, c.name);
+        }
+        const queuedRows = await sbGet(`pending_contacts?user_id=eq.${userId}&select=linkedin_url`);
+        const waiting = new Set(queuedRows.map(q => q.linkedin_url));
+        const alreadyKnown = profiles.filter(u => known.has(u)).map(u => known.get(u));
+        const alreadyWaiting = profiles.filter(u => !known.has(u) && waiting.has(u)).length;
+        const fresh = profiles.filter(u => !known.has(u) && !waiting.has(u));
+        if (fresh.length) {
+          const rows = fresh.map(u => ({ user_id: userId, linkedin_url: u, suggested_name: nameFromLinkedInUrl(u), context, source: 'telegram' }));
+          // Upsert on the unique key, so the same link arriving twice at once can't
+          // turn into a constraint error and a "something went wrong" reply.
+          await sbUpsert('pending_contacts', rows, 'user_id,linkedin_url');
+          lines.push(`Added ${fresh.length} to Confirm in the app:`);
+          for (const r of rows) lines.push(`• ${r.suggested_name}`);
+          if (context) lines.push(`Your note goes with ${fresh.length === 1 ? 'them' : 'each of them'}: "${context}"`);
+        }
+        if (alreadyKnown.length) lines.push(`Already in your network: ${alreadyKnown.join(', ')}`);
+        if (alreadyWaiting) lines.push(`Already waiting in Confirm: ${alreadyWaiting}`);
+        if (links.profiles.length > MAX_LINKS_PER_MESSAGE) lines.push(`I took the first ${MAX_LINKS_PER_MESSAGE} links — send the rest in another message.`);
+      }
+      if (links.notProfiles) lines.push(`Skipped ${links.notProfiles} link${links.notProfiles === 1 ? " that isn't a personal profile" : "s that aren't personal profiles"}.`);
+      if (links.shortLinks) lines.push(`I can't open lnkd.in short links — paste the full linkedin.com/in/… address instead.`);
+      const reply = lines.join('\n');
+      await sendTelegramMessage(chatId, transcript ? `🎤 "${transcript}"\n\n${reply}` : reply);
+      return res.json({ ok: true });
     }
 
     const contacts = await sbGet(`contacts?user_id=eq.${userId}&archived=eq.false&select=id,name,role,tier,last_contact,last_note,intention,interactions,tasks_json,birthday,cadence_days`);
