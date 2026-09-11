@@ -183,9 +183,83 @@ function matchContacts(contacts, query) {
   return contacts.filter(c => c.name?.toLowerCase().includes(q));
 }
 
+// Words too common to be evidence of a name. Without this, "had" pulls in every
+// Hadi and "call" every Callum, and the shortlist fills with noise.
+const NAME_STOPWORDS = new Set([
+  'the', 'and', 'with', 'had', 'have', 'has', 'call', 'called', 'calling', 'met', 'meet',
+  'meeting', 'coffee', 'lunch', 'dinner', 'today', 'tomorrow', 'yesterday', 'next', 'last',
+  'week', 'month', 'for', 'from', 'about', 'note', 'task', 'remind', 'follow', 'up', 'log',
+  'she', 'her', 'him', 'his', 'they', 'them', 'their', 'that', 'this', 'what', 'when',
+  'who', 'how', 'was', 'were', 'will', 'just', 'new', 'role', 'intention', 'send', 'email',
+  'message', 'chat', 'talk', 'talked', 'spoke', 'said', 'says', 'birthday', 'overdue',
+]);
+
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+// Unicode-aware so Arabic names tokenize too — they're common in this network.
+function nameTokens(s) {
+  return (String(s).toLowerCase().match(/[\p{L}\p{N}]+/gu) || []);
+}
+
+// How strongly one message word suggests one name token. 0 means no evidence.
+function tokenScore(word, tok) {
+  if (word === tok) return 3;
+  const min = Math.min(word.length, tok.length);
+  // "nick" → "nicolas", "moh" → "mohammed": a spoken short form of the name.
+  if (min >= 3 && (tok.startsWith(word) || word.startsWith(tok))) return 2;
+  let shared = 0;
+  while (shared < min && word[shared] === tok[shared]) shared++;
+  if (shared >= 3 && min >= 4) return 1.5;
+  // Voice transcription misspellings: "nikolas" → "nicolas", "ahmed" → "ahmad".
+  if (min >= 4 && levenshtein(word, tok) <= (min >= 7 ? 2 : 1)) return 1;
+  return 0;
+}
+
+// The classifier used to receive every contact name on every message — ~900 of
+// them for the main account, a few thousand tokens per "log a call with Ahmad".
+// The list exists so the model can map a mangled transcript onto a real name,
+// which only needs the names that plausibly match what was said. This returns
+// those, best first, capped. Matching after classification is unchanged, so a
+// miss here costs at most a "couldn't find" reply, never a wrong contact.
+const MAX_NAME_CANDIDATES = 30;
+function candidateNames(text, contacts) {
+  const words = nameTokens(text).filter(w => w.length >= 2 && !NAME_STOPWORDS.has(w));
+  if (!words.length) return [];
+  const scored = [];
+  for (const c of contacts) {
+    if (!c.name) continue;
+    let score = 0;
+    for (const tok of nameTokens(c.name)) {
+      if (tok.length < 2) continue;
+      let best = 0;
+      for (const w of words) best = Math.max(best, tokenScore(w, tok));
+      score += best;
+    }
+    if (score > 0) scored.push({ name: c.name, score });
+  }
+  scored.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+  return scored.slice(0, MAX_NAME_CANDIDATES).map(s => s.name);
+}
+
 async function classifyTelegramIntent(text, contacts) {
   const today = new Date().toISOString().slice(0, 10);
-  const names = contacts.map(c => c.name).join(', ');
+  const candidates = candidateNames(text, contacts);
+  const names = candidates.length
+    ? candidates.join(', ')
+    : '(no likely matches — copy any person\'s name exactly as it appears in the message)';
   const prompt = `You are an intent classifier for a relationship-management Telegram bot. Today's date is ${today}.
 The user's contacts: ${names || '(none)'}.
 
