@@ -456,7 +456,7 @@ app.post('/api/suggest', async (req, res) => {
 Here is one contact:
 ${JSON.stringify(c, null, 2)}
 
-Write a single short outreach suggestion — 2 to 3 sentences, addressed to the user (not to the contact) — telling them why to reach out now and what specifically to open with.
+Write a short outreach suggestion addressed to the user (not to the contact): at most two sentences and 45 words in total. The first sentence says why now; the second says exactly what to open with. It is read on a small dashboard card, so it must be scannable.
 
 Ground it in this contact's actual details: who they are, their recent notes, achievements, interactions, and how long it has been. Be concrete. Never invent facts that are not present above. Do not use headings, bullet points or a greeting — just the suggestion itself.
 
@@ -643,6 +643,40 @@ app.post('/api/enrich-linkedin', requireAuth, async (req, res) => {
     res.json({ suggestion, cached: false, fetchedAt: new Date().toISOString() });
   } catch (err) {
     console.error('Error in /api/enrich-linkedin:', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+// Always use supabase.auth.getUser(). Never hardcode user IDs.
+//
+// Resolves the real name for a queued LinkedIn profile. The Confirm queue guesses
+// names from the URL slug, which fails on single-word handles ("ritaalmela"). This
+// reads the profile once — one Apify call, only when the user clicks it for that
+// card, never in bulk — and writes the name back onto the queued row.
+app.post('/api/pending-name', requireAuth, async (req, res) => {
+  try {
+    const { pendingId } = req.body || {};
+    if (!pendingId || typeof pendingId !== 'string') return res.status(400).json({ error: 'pendingId is required' });
+
+    // Scoped by user_id: the service key bypasses RLS, so this filter is the only
+    // thing stopping one user from spending Apify credit on another's queue.
+    const rows = await sbGet(`pending_contacts?id=eq.${encodeURIComponent(pendingId)}&user_id=eq.${req.userId}&select=id,linkedin_url`);
+    const row = rows?.[0];
+    if (!row) return res.status(404).json({ error: 'Queued contact not found' });
+
+    const profile = await fetchLinkedInProfile(row.linkedin_url);
+    if (!profile) return res.status(404).json({ error: 'No public data found for that profile', code: 'not_found' });
+
+    // lastName can carry credentials after a comma: "Rahman, PharmD".
+    const first = String(profile.firstName || '').trim();
+    const last = String(profile.lastName || '').split(',')[0].trim();
+    const name = `${first} ${last}`.trim();
+    if (!name) return res.status(404).json({ error: 'That profile has no name on it', code: 'no_name' });
+
+    await sbPatch(`pending_contacts?id=eq.${encodeURIComponent(pendingId)}&user_id=eq.${req.userId}`, { suggested_name: name });
+    res.json({ name });
+  } catch (err) {
+    console.error('Error in /api/pending-name:', err);
     res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
@@ -1133,7 +1167,9 @@ function buildDigest(contacts) {
   tasks.sort((a, b) => a.due.localeCompare(b.due));
   neverTiered.sort((a, b) => (TIER_RANK[a.tier] ?? 3) - (TIER_RANK[b.tier] ?? 3) || String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')));
 
-  const untriaged = never.length - neverTiered.length;
+  // Unsorted = never contacted, still General, and not deliberately kept there from
+  // sort mode (sorted_at). Mirrors isUntriaged() in the app — keep the two in step.
+  const untriaged = never.filter(c => c.tier === 'general' && !c.sorted_at).length;
   const hasContent = overdue.length + dueSoon.length + birthdays.length + tasks.length + neverTiered.length > 0;
   return { overdue, dueSoon, never, neverTiered, untriaged, birthdays, tasks, hasContent };
 }
@@ -1276,7 +1312,7 @@ function renderDigestText(digest, contactCount) {
 // Always resolve contacts by the target user's own id — never a shared or default scope.
 async function sendDigestForUser(userId, email, { force = false } = {}) {
   if (!email) return { sent: false, reason: 'no email' };
-  const contacts = await sbGet(`contacts?user_id=eq.${userId}&archived=eq.false&select=id,name,role,tier,last_contact,birthday,cadence_days,tasks_json`);
+  const contacts = await sbGet(`contacts?user_id=eq.${userId}&archived=eq.false&select=id,name,role,tier,last_contact,birthday,cadence_days,tasks_json,sorted_at`);
   if (!contacts.length) return { sent: false, reason: 'no contacts' };
 
   const digest = buildDigest(contacts);
